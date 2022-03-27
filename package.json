@@ -22,8 +22,10 @@
   "license": "MIT",
   "dependencies": {
     "@nut-tree/nut-js": "^2.0.2-next.20220324193210",
+    "@tonaljs/midi": "^4.6.5",
     "fs-extra": "^10.0.1",
     "libnut": "github:nut-tree/libnut#pull/59/head",
+    "midi-writer-js": "^2.1.0",
     "prettier": "^2.6.1",
     "prompt": "^1.2.2",
     "screenshot-desktop": "^1.12.7",

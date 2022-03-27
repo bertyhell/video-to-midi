@@ -2,44 +2,15 @@ import prompt from 'prompt'
 import fs from 'fs-extra'
 import screenshot from 'screenshot-desktop'
 import sharp from 'sharp'
-import { mouse, Point } from '@nut-tree/nut-js'
+import { findClosestIndex, getKeyPositionsFromSettings, getMousePosition, getPixel } from './helpers.js'
+import { CalibrationSettings, LineIndex, NoteIndex } from './types.js'
+import MidiWriter, { Duration, Pitch } from 'midi-writer-js'
+import Midi from '@tonaljs/midi'
 
 const SONG_DURATION_IN_MINUTES = 5
 
-interface CalibrationSettings {
-	leftMostKeyPosition: Point
-	rightMostKeyPosition: Point
-	cSharpKeyPosition: Point
-	numOfKeys: number
-}
-
-function getPixel(buffer: Buffer, x: number, y: number, width: number): { r: number; g: number; b: number } {
-	const pixelOffset = width * y + x
-	return {
-		r: buffer[pixelOffset * 3],
-		g: buffer[pixelOffset * 3 + 1],
-		b: buffer[pixelOffset * 3 + 2],
-	}
-}
-
-function setPixel(buffer: Buffer, x: number, y: number, width: number, color: { r: number; g: number; b: number }): void {
-	const pixelOffset = width * y + x
-	buffer[pixelOffset * 3] = 255
-	buffer[pixelOffset * 3 + 1] = 0
-	buffer[pixelOffset * 3 + 2] = 255
-}
-
-/**
- * Workaround for a bug in the nut-js package: https://github.com/nut-tree/libnut/pull/59
- */
-async function getMousePosition(): Promise<Point> {
-	const mousePosition = await mouse.getPosition()
-	return {
-		...mousePosition,
-		x: Math.round(mousePosition.x),
-		y: Math.round(mousePosition.y),
-	}
-}
+const CAPTURE_RATE_TO_START_TICK_RATIO = 3
+const CAPTURE_RATE_TO_NOTE_DURATION_RATIO = 3
 
 async function fetchNewCalibrationSettings(): Promise<CalibrationSettings> {
 	await prompt.get([
@@ -82,7 +53,7 @@ async function fetchNewCalibrationSettings(): Promise<CalibrationSettings> {
 	return {
 		leftMostKeyPosition,
 		rightMostKeyPosition,
-		cSharpKeyPosition,
+		c4KeyPosition: cSharpKeyPosition,
 		numOfKeys,
 	}
 }
@@ -93,7 +64,7 @@ async function calibrateKeyboard(): Promise<CalibrationSettings> {
 	let useSameAsLast = false
 	let leftMostKeyPosition: { x: number; y: number }
 	let rightMostKeyPosition: { x: number; y: number }
-	let cSharpKeyPosition: { x: number; y: number }
+	let c4KeyPosition: { x: number; y: number }
 	let numOfKeys: number
 
 	if (await fs.pathExists('./last-settings.json')) {
@@ -114,40 +85,29 @@ async function calibrateKeyboard(): Promise<CalibrationSettings> {
 		const lastSettings: CalibrationSettings = await fs.readJson('./last-settings.json')
 		leftMostKeyPosition = lastSettings.leftMostKeyPosition
 		rightMostKeyPosition = lastSettings.rightMostKeyPosition
-		cSharpKeyPosition = lastSettings.cSharpKeyPosition
+		c4KeyPosition = lastSettings.c4KeyPosition
 		numOfKeys = lastSettings.numOfKeys
 	} else {
 		const settings: CalibrationSettings = await fetchNewCalibrationSettings()
 		leftMostKeyPosition = settings.leftMostKeyPosition
 		rightMostKeyPosition = settings.rightMostKeyPosition
-		cSharpKeyPosition = settings.cSharpKeyPosition
+		c4KeyPosition = settings.c4KeyPosition
 		numOfKeys = settings.numOfKeys
 
-		await fs.writeJson('./last-settings.json', settings)
+		await fs.writeJson('./last-settings.json', settings, { spaces: 2 })
 	}
 
 	return {
 		leftMostKeyPosition,
 		rightMostKeyPosition,
-		cSharpKeyPosition,
+		c4KeyPosition: c4KeyPosition,
 		numOfKeys,
 	}
 }
 
 async function captureMidiData(settings: CalibrationSettings): Promise<boolean[][]> {
 	return new Promise<boolean[][]>(async (resolve) => {
-		const leftMostKeyPosition: { x: number; y: number } = settings.leftMostKeyPosition
-		const rightMostKeyPosition: { x: number; y: number } = settings.rightMostKeyPosition
-		const numOfKeys: number = settings.numOfKeys
-
-		const verticalPositionY: number = Math.round((leftMostKeyPosition.y + rightMostKeyPosition.y) / 2)
-
-		const horizontalPositionsX: number[] = []
-		const pianoWidth = rightMostKeyPosition.x - leftMostKeyPosition.x
-
-		for (let i = 0; i < numOfKeys; i++) {
-			horizontalPositionsX.push(Math.round(leftMostKeyPosition.x + (i * pianoWidth) / (numOfKeys - 1)))
-		}
+		const { verticalPositionY, horizontalPositionsX } = getKeyPositionsFromSettings(settings)
 
 		console.log('Ready to play the video...')
 		const screen = await screenshot({ format: 'jpg' })
@@ -185,7 +145,7 @@ async function captureMidiData(settings: CalibrationSettings): Promise<boolean[]
 				const average = (color.r + color.g + color.b) / 3
 				return Math.abs(color.r - average) > epsilon || Math.abs(color.g - average) > epsilon || Math.abs(color.b - average) > epsilon
 			})
-			// console.log(keyActivation.map((isKeyActive) => (isKeyActive ? '❎' : '_')).join(''))
+			console.log(keyActivation.map((isKeyActive) => (isKeyActive ? '❎' : '_')).join(''))
 			keyActivations.push(keyActivation)
 		}, 50)
 
@@ -198,10 +158,8 @@ async function captureMidiData(settings: CalibrationSettings): Promise<boolean[]
 	})
 }
 
-type NoteIndex = number
-type LineIndex = number
-
-async function convertCapturedDataToMidi(midiData: boolean[][]) {
+function convertCapturedDataToMidi(midiData: boolean[][], settings: CalibrationSettings): Uint8Array {
+	// Convert keyboard activation data to notes with start and end times
 	let passedInitialBlanks = false
 	const notes: { noteIndex: NoteIndex; startIndex: LineIndex; endIndex: LineIndex }[] = []
 	const activeNotes: Record<NoteIndex, LineIndex> = {}
@@ -229,15 +187,43 @@ async function convertCapturedDataToMidi(midiData: boolean[][]) {
 		}
 	})
 
-	console.log(notes)
+	// Create midi file
+	const track = new MidiWriter.Track()
+	track.addEvent(new MidiWriter.ProgramChangeEvent({ instrument: 1 }))
+
+	// Figure out which key is the C4 key
+	const C4_MIDI_INDEX = 60 // https://www.inspiredacoustics.com/en/MIDI_note_numbers_and_center_frequencies
+	const { horizontalPositionsX } = getKeyPositionsFromSettings(settings)
+	const c4NoteIndex: number = findClosestIndex(settings.c4KeyPosition.x, horizontalPositionsX)
+	const leftMostKeyMidiIndex = C4_MIDI_INDEX - c4NoteIndex
+
+	notes.forEach((note) => {
+		const noteEvent = new MidiWriter.NoteEvent({
+			// Convert noteIndex (0 - 67) to pitch names ('C4', 'C#4', 'D4', ...)
+			pitch: [Midi.midiToNoteName(leftMostKeyMidiIndex + note.noteIndex) as Pitch],
+			duration: ('T' + (note.endIndex - note.startIndex) * CAPTURE_RATE_TO_NOTE_DURATION_RATIO) as Duration,
+			startTick: note.startIndex * CAPTURE_RATE_TO_START_TICK_RATIO,
+		})
+		track.addEvent(noteEvent)
+	})
+
+	// Write midi file to disk
+	const writer = new MidiWriter.Writer(track)
+	return writer.buildFile()
 }
 
 let midiData: boolean[][]
+let settings: CalibrationSettings
+
 if (!(await fs.pathExists('./midi-capture.json'))) {
-	const settings: CalibrationSettings = await calibrateKeyboard()
+	settings = await calibrateKeyboard()
 	midiData = await captureMidiData(settings)
 } else {
+	settings = await fs.readJson('./last-settings.json')
 	midiData = await fs.readJson('./midi-capture.json')
 }
 
-const midiBuffer = convertCapturedDataToMidi(midiData)
+const midiBuffer: Uint8Array = convertCapturedDataToMidi(midiData, settings)
+
+await fs.writeFile('./song.mid', midiBuffer)
+console.log('File song.mid written to disk')

@@ -3,3 +3,4 @@ node_modules
 midi-capture.json
 detection-points.jpg
 last-settings.json
+*.mid
